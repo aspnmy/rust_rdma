@@ -1,0 +1,10 @@
+[package]
+name = "rust_rdma"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ibverbs-sys = "0.3.2+55.0"
+nix = { version = "0.28", features = ["net", "socket"] }
+byteorder = "1"
+rand = "0.8"
