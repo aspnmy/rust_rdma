@@ -1,20 +1,21 @@
 use ibverbs_sys::*;
 use nix::sys::socket::*;
-use nix::unistd::close;
-use std::mem::zeroed;
+use rust_rdma::{
+    check, get_lid, get_port_mtu, tcp_recv_exact, tcp_send_all, ConnInfo, CONTROL_PORT,
+};
+use std::mem::{size_of, zeroed};
 use std::net::Ipv4Addr;
 use std::os::raw::c_void;
 use std::ptr;
 
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct ConnInfo {
-    pub qp_num: u32,
-    pub rkey: u32,
-    pub buf_addr: u64,
-}
+const DATA_SIZE: usize = 64;
+const LOCAL_MEM_SIZE: usize = 4096;
 
-const CONTROL_PORT: u16 = 9999;
+/// 客户端专用，带 "[客户端]" 前缀的断言
+#[inline]
+fn cli_check(cond: bool, msg: &str) {
+    check!(cond, &format!("[客户端] 错误: {}", msg));
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -22,98 +23,236 @@ fn main() {
         eprintln!("用法: {} <服务端IP>", args[0]);
         return;
     }
-
     let server_ip = &args[1];
 
     unsafe {
-        // --------------------------
-        // 连接服务端获取信息
-        // --------------------------
-        let sock = socket(AddressFamily::Inet, SockType::Stream, SockFlag::empty(), None).unwrap();
+        println!("[客户端] === RDMA Client 启动 ===");
+        println!("[客户端] 目标服务端: {}", server_ip);
+
+        // ============== 步进 1: TCP 控制通道 ==============
+        println!("[客户端] 步进 1/8: TCP 连接服务端");
+        let sock = socket(
+            AddressFamily::Inet,
+            SockType::Stream,
+            SockFlag::empty(),
+            None,
+        )
+        .unwrap();
         let ip = server_ip.parse::<Ipv4Addr>().unwrap();
         let octets = ip.octets();
         let sa = SockaddrIn::new(octets[0], octets[1], octets[2], octets[3], CONTROL_PORT);
         connect(sock, &sa).unwrap();
+        println!("[客户端]    已连接服务端 {}:{}", server_ip, CONTROL_PORT);
 
-        let mut info: ConnInfo = zeroed();
-        recv(sock, &mut info as *mut _ as *mut u8, std::mem::size_of::<ConnInfo>(), MsgFlags::empty()).unwrap();
-        close(sock);
-
-        println!("[客户端] 成功获取服务端信息");
-        println!("  QP: {}", info.qp_num);
-        println!("  RKey: 0x{:x}", info.rkey);
-        println!("  远程内存地址: 0x{:x}", info.buf_addr);
-
-        // --------------------------
-        // 初始化本地 RDMA
-        // --------------------------
-        let dev_list = ibv_get_device_list(ptr::null_mut());
-        let ctx = ibv_open_device(*dev_list);
-        let pd = ibv_alloc_pd(ctx);
-        let cq = ibv_create_cq(ctx, 128, ptr::null_mut(), ptr::null_mut(), 0);
-
-        let mut buf = vec![0u8; 4096];
-        let mr = ibv_reg_mr(
-            pd,
-            buf.as_mut_ptr() as *mut c_void,
-            buf.len(),
-            ibverbs_sys::IBV_ACCESS_LOCAL_WRITE.0 as i32,
+        // 接收服务端 ConnInfo (字节序还原)
+        let mut raw_buf = vec![0u8; size_of::<ConnInfo>()];
+        tcp_recv_exact(sock, &mut raw_buf).unwrap();
+        let mut server_info: ConnInfo = zeroed();
+        server_info.from_bytes(&raw_buf);
+        let server_info = server_info.from_be();
+        println!(
+            "[客户端]    收到服务端 ConnInfo (QP={}, LID={}, RKey=0x{:x}, Buf=0x{:x})",
+            server_info.qp_num, server_info.lid, server_info.rkey, server_info.buf_addr
         );
 
-        // --------------------------
-        // 创建 QP
-        // --------------------------
+        // ============== 步进 2: 初始化本地 RDMA ==============
+        println!("[客户端] 步进 2/8: 打开 RDMA 设备");
+        let dev_list = ibv_get_device_list(ptr::null_mut());
+        cli_check(!dev_list.is_null(), "ibv_get_device_list 失败");
+        let dev = *dev_list;
+        cli_check(!dev.is_null(), "没有可用的 RDMA 设备");
+        let ctx = ibv_open_device(dev);
+        cli_check(!ctx.is_null(), "ibv_open_device 失败");
+        // Bug 3: 释放设备列表
+        ibv_free_device_list(dev_list);
+
+        println!("[客户端] 步进 3/8: 分配 PD + 注册本地 MR");
+        let pd = ibv_alloc_pd(ctx);
+        cli_check(!pd.is_null(), "ibv_alloc_pd 失败");
+
+        // 分配本地内存作为 RDMA Write 的数据源
+        let mut local_buf = vec![0u8; LOCAL_MEM_SIZE];
+        let msg = b"Hello from RDMA Client! This data was written via RDMA Write.";
+        let write_len = DATA_SIZE.min(local_buf.len());
+        let copy_len = msg.len().min(write_len);
+        local_buf[..copy_len].copy_from_slice(&msg[..copy_len]);
+        if copy_len < write_len {
+            let footer = b"\n[EOF]";
+            let footer_len = footer.len().min(write_len - copy_len);
+            local_buf[copy_len..copy_len + footer_len].copy_from_slice(&footer[..footer_len]);
+        }
+
+        let mr = ibv_reg_mr(
+            pd,
+            local_buf.as_mut_ptr() as *mut c_void,
+            local_buf.len(),
+            IBV_ACCESS_LOCAL_WRITE.0 as i32,
+        );
+        cli_check(!mr.is_null(), "ibv_reg_mr 失败");
+
+        println!("[客户端] 步进 4/8: 创建 CQ + QP");
+        let cq = ibv_create_cq(ctx, 128, ptr::null_mut(), ptr::null_mut(), 0);
+        cli_check(!cq.is_null(), "ibv_create_cq 失败");
+
         let mut qp_init: ibv_qp_init_attr = zeroed();
         qp_init.send_cq = cq;
         qp_init.recv_cq = cq;
         qp_init.qp_type = ibv_qp_type::IBV_QPT_RC;
+        qp_init.sq_sig_all = 1;
         qp_init.cap.max_send_wr = 32;
         qp_init.cap.max_recv_wr = 32;
         qp_init.cap.max_send_sge = 1;
         qp_init.cap.max_recv_sge = 1;
 
-        let qp = ibv_create_qp(pd, &qp_init);
+        let qp = ibv_create_qp(pd, &mut qp_init);
+        cli_check(!qp.is_null(), "ibv_create_qp 失败");
 
+        // ============== 步进 5: QP → INIT + 查询 LID ==============
+        println!("[客户端] 步进 5/8: QP → INIT");
         let mut attr: ibv_qp_attr = zeroed();
         attr.qp_state = ibv_qp_state::IBV_QPS_INIT;
+        attr.pkey_index = 0;
         attr.port_num = 1;
-        ibv_modify_qp(
+        // Bug 1: 客户端 QP 不需要远程访问权限，设为 0
+        attr.qp_access_flags = 0;
+        let ret = ibv_modify_qp(
             qp,
             &mut attr,
-            (ibverbs_sys::IBV_QP_STATE.0 | ibverbs_sys::IBV_QP_PORT.0) as i32,
+            (IBV_QP_STATE.0 | IBV_QP_PKEY_INDEX.0 | IBV_QP_PORT.0 | IBV_QP_ACCESS_FLAGS.0) as i32,
+        );
+        cli_check(ret == 0, &format!("INIT 失败, ret={}", ret));
+
+        let client_lid = get_lid(ctx, 1);
+        let active_mtu = get_port_mtu(ctx, 1);
+        println!(
+            "[客户端]    本端 LID: {}, active MTU: {:?}",
+            client_lid, active_mtu
         );
 
-        // --------------------------
-        // 连接到服务端 QP
-        // --------------------------
-        attr.qp_state = ibv_qp_state::IBV_QPS_RTR;
-        attr.dest_qp_num = info.qp_num;
-        attr.rq_psn = 0;
-        ibv_modify_qp(
-            qp,
-            &mut attr,
-            (ibverbs_sys::IBV_QP_STATE.0
-                | ibverbs_sys::IBV_QP_DEST_QPN.0
-                | ibverbs_sys::IBV_QP_RQ_PSN.0) as i32,
+        // 发送客户端 ConnInfo → 服务端 (字节序转换)
+        let client_info = ConnInfo {
+            qp_num: (*qp).qp_num,
+            rkey: (*mr).rkey,
+            buf_addr: local_buf.as_ptr() as u64,
+            lid: client_lid,
+            port: 1,
+        };
+        let be_info = client_info.to_be();
+        tcp_send_all(sock, be_info.as_bytes()).unwrap();
+        println!(
+            "[客户端]    已发送客户端 ConnInfo (QP={}, LID={})",
+            client_info.qp_num, client_info.lid
         );
+        drop(sock);
 
-        attr.qp_state = ibv_qp_state::IBV_QPS_RTS;
-        attr.sq_psn = 0;
-        ibv_modify_qp(
-            qp,
-            &mut attr,
-            (ibverbs_sys::IBV_QP_STATE.0 | ibverbs_sys::IBV_QP_SQ_PSN.0) as i32,
-        );
+        // ============== 步进 6: QP → RTR ==============
+        println!("[客户端] 步进 6/8: QP → RTR");
+        let mut rtr_attr: ibv_qp_attr = zeroed();
+        rtr_attr.qp_state = ibv_qp_state::IBV_QPS_RTR;
+        rtr_attr.dest_qp_num = server_info.qp_num;
+        rtr_attr.rq_psn = 0;
+        rtr_attr.max_dest_rd_atomic = 1;
+        rtr_attr.min_rnr_timer = 12;
+        // Bug 2: 设置实际 port 的 active MTU
+        rtr_attr.path_mtu = active_mtu;
+        rtr_attr.ah_attr.dlid = server_info.lid;
+        rtr_attr.ah_attr.sl = 0;
+        rtr_attr.ah_attr.src_path_bits = 0;
+        rtr_attr.ah_attr.static_rate = 0;
+        rtr_attr.ah_attr.is_global = 0;
+        rtr_attr.ah_attr.port_num = 1;
 
-        println!("[客户端] RDMA 连接建立完成！");
-        println!("========================================");
-        println!("现在你可以：");
-        println!("  1. RDMA Write  写服务端内存");
-        println!("  2. RDMA Read   读服务端内存");
-        println!("========================================");
+        let rtr_mask = (IBV_QP_STATE.0
+            | IBV_QP_AV.0
+            | IBV_QP_PATH_MTU.0
+            | IBV_QP_DEST_QPN.0
+            | IBV_QP_RQ_PSN.0
+            | IBV_QP_MAX_DEST_RD_ATOMIC.0
+            | IBV_QP_MIN_RNR_TIMER.0) as i32;
+        let ret = ibv_modify_qp(qp, &mut rtr_attr, rtr_mask);
+        cli_check(ret == 0, &format!("RTR 失败, ret={}", ret));
 
+        // ============== 步进 7: QP → RTS ==============
+        println!("[客户端] 步进 7/8: QP → RTS");
+        let mut rts_attr: ibv_qp_attr = zeroed();
+        rts_attr.qp_state = ibv_qp_state::IBV_QPS_RTS;
+        rts_attr.sq_psn = 0;
+        rts_attr.timeout = 14;
+        rts_attr.retry_cnt = 7;
+        rts_attr.rnr_retry = 7;
+        rts_attr.max_rd_atomic = 1;
+
+        let rts_mask = (IBV_QP_STATE.0
+            | IBV_QP_SQ_PSN.0
+            | IBV_QP_TIMEOUT.0
+            | IBV_QP_RETRY_CNT.0
+            | IBV_QP_RNR_RETRY.0
+            | IBV_QP_MAX_QP_RD_ATOMIC.0) as i32;
+        let ret = ibv_modify_qp(qp, &mut rts_attr, rts_mask);
+        cli_check(ret == 0, &format!("RTS 失败, ret={}", ret));
+
+        // ============== 步进 8: 执行 RDMA Write ==============
+        println!("[客户端] 步进 8/8: 执行 RDMA Write...");
+
+        // 构造 SGE (Scatter/Gather Element)
+        let mut sge = ibv_sge {
+            addr: local_buf.as_ptr() as u64,
+            length: DATA_SIZE as u32,
+            lkey: (*mr).lkey,
+        };
+
+        // 构造 Send WR
+        let mut wr: ibv_send_wr = zeroed();
+        wr.wr_id = 1;
+        wr.next = ptr::null_mut();
+        wr.sg_list = &mut sge;
+        wr.num_sge = 1;
+        wr.opcode = ibv_wr_opcode::IBV_WR_RDMA_WRITE;
+        wr.send_flags = ibverbs_sys::IBV_SEND_SIGNALED.0 as u32;
+        wr.wr.rdma.remote_addr = server_info.buf_addr;
+        wr.wr.rdma.rkey = server_info.rkey;
+
+        let mut bad_wr: *mut ibv_send_wr = ptr::null_mut();
+        let ret = ibv_post_send(qp, &mut wr, &mut bad_wr);
+        cli_check(ret == 0, &format!("ibv_post_send 失败, ret={}", ret));
+        println!("[客户端]    RDMA Write 请求已提交");
+
+        // 轮询 CQ 获取完成事件
+        let mut wc: ibv_wc = zeroed();
+        let mut poll_count = 0;
         loop {
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            let ne = ibv_poll_cq(cq, 1, &mut wc);
+            if ne > 0 {
+                break;
+            }
+            if ne < 0 {
+                panic!("[客户端] ibv_poll_cq 错误: {}", ne);
+            }
+            poll_count += 1;
+            if poll_count > 5000 {
+                panic!("[客户端] 轮询超时 (5s)");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
+
+        let status = wc.status;
+        cli_check(
+            status == ibv_wc_status::IBV_WC_SUCCESS.0 as u32,
+            &format!("RDMA Write 完成状态异常: 0x{:x}", status),
+        );
+        println!("[客户端]    ✓ RDMA Write 完成! (WC status=SUCCESS)");
+        println!(
+            "[客户端]    写到服务端 0x{:x} (rkey=0x{:x}) 共 {} 字节",
+            server_info.buf_addr, server_info.rkey, wc.byte_len,
+        );
+        println!("[客户端]    写入数据: {:?}", &local_buf[..DATA_SIZE]);
+
+        // RDMA 资源清理
+        ibv_destroy_qp(qp);
+        ibv_destroy_cq(cq);
+        ibv_dereg_mr(mr);
+        ibv_dealloc_pd(pd);
+        ibv_close_device(ctx);
+        println!("[客户端] === RDMA Write 成功! ===");
     }
 }

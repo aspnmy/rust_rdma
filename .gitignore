@@ -1,1 +1,4 @@
 /target
+
+# Rust Loop Optimize skill temporary files
+_loop_*
