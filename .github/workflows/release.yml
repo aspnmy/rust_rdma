@@ -1,0 +1,137 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build-${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            cross: false
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+            cross: true
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive: tar.gz
+            cross: true
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar.gz
+            cross: false
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+            cross: false
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+            cross: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Setup cross (cross-compilation)
+        if: matrix.cross == true
+        shell: bash
+        run: |
+          curl -fsSL https://github.com/cross-rs/cross/releases/latest/download/cross-x86_64-unknown-linux-musl.tar.gz | tar -xz -C /tmp
+          mv /tmp/cross /usr/local/bin/cross
+          cross --version
+
+      - name: Install RDMA dependencies (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libibverbs-dev rdma-core 2>/dev/null || echo "⚠ RDMA 库不可用，使用 vendor 编译"
+
+      - name: Build (native)
+        if: matrix.cross == false
+        shell: bash
+        run: |
+          cargo build --release --target ${{ matrix.target }} --bin rdma_server --bin rdma_client
+
+      - name: Build (cross)
+        if: matrix.cross == true
+        shell: bash
+        run: |
+          cross build --release --target ${{ matrix.target }} --bin rdma_server --bin rdma_client
+
+      - name: Prepare artifact directory
+        shell: bash
+        run: |
+          mkdir -p dist
+          # 复制所有编译产物
+          cp "target/${{ matrix.target }}/release/rdma_server" dist/ 2>/dev/null || true
+          cp "target/${{ matrix.target }}/release/rdma_client" dist/ 2>/dev/null || true
+          # Windows 需要 .exe 后缀
+          cp "target/${{ matrix.target }}/release/rdma_server.exe" dist/ 2>/dev/null || true
+          cp "target/${{ matrix.target }}/release/rdma_client.exe" dist/ 2>/dev/null || true
+          if [ -f README.md ]; then cp README.md dist/; fi
+          if [ -f LICENSE ]; then cp LICENSE dist/; fi
+
+      - name: Create tar.gz archive
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          cd dist
+          tar -czf "../rust_rdma-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" .
+          cd ..
+          ls -la "rust_rdma-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
+
+      - name: Create zip archive
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist/*" -DestinationPath "rust_rdma-${{ github.ref_name }}-${{ matrix.target }}.zip"
+          Get-Item "rust_rdma-${{ github.ref_name }}-${{ matrix.target }}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust_rdma-${{ github.ref_name }}-${{ matrix.target }}
+          path: rust_rdma-${{ github.ref_name }}-${{ matrix.target }}.*
+          compression-level: 0
+          retention-days: 7
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Display artifacts
+        run: ls -R artifacts/
+
+      - name: Create Release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: 'artifacts/**/*'
+          generate_release_notes: true
+          prerelease: false
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
