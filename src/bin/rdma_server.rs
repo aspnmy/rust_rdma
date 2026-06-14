@@ -2,10 +2,12 @@ use ibverbs_sys::*;
 use nix::sys::socket::*;
 use nix::unistd::close;
 use rust_rdma::{
-    check, get_lid, get_port_mtu, tcp_recv_exact, tcp_send_all, ConnInfo, CONTROL_PORT,
+    check, get_lid, get_port_mtu, qp_to_init, qp_to_rtr, qp_to_rts, tcp_recv_exact, tcp_send_all,
+    ConnInfo, CONTROL_PORT,
 };
 use std::alloc::{alloc, dealloc, Layout};
 use std::mem::{size_of, zeroed};
+use std::net::Ipv4Addr;
 use std::os::raw::c_void;
 use std::ptr;
 
@@ -31,7 +33,6 @@ fn main() {
         srv_check(!dev.is_null(), "没有可用的 RDMA 设备");
         let ctx = ibv_open_device(dev);
         srv_check(!ctx.is_null(), "ibv_open_device 失败");
-        // Bug 3: 释放设备列表
         ibv_free_device_list(dev_list);
 
         println!("[服务端] 步进 2/8: 分配保护域 (PD)");
@@ -73,17 +74,12 @@ fn main() {
 
         // ============== QP → INIT ==============
         println!("[服务端] 步进 5/8: QP 状态转换 INIT");
-        let mut attr: ibv_qp_attr = zeroed();
-        attr.qp_state = ibv_qp_state::IBV_QPS_INIT;
-        attr.pkey_index = 0;
-        attr.port_num = 1;
-        attr.qp_access_flags = (IBV_ACCESS_REMOTE_WRITE.0 | IBV_ACCESS_REMOTE_READ.0) as u32;
-        let ret = ibv_modify_qp(
+        qp_to_init(
             qp,
-            &mut attr,
-            (IBV_QP_STATE.0 | IBV_QP_PKEY_INDEX.0 | IBV_QP_PORT.0 | IBV_QP_ACCESS_FLAGS.0) as i32,
-        );
-        srv_check(ret == 0, &format!("INIT 失败, ret={}", ret));
+            1,
+            (IBV_ACCESS_REMOTE_WRITE.0 | IBV_ACCESS_REMOTE_READ.0) as u32,
+        )
+        .unwrap_or_else(|e| panic!("[服务端] {}", e));
 
         let lid = get_lid(ctx, 1);
         let active_mtu = get_port_mtu(ctx, 1);
@@ -101,7 +97,7 @@ fn main() {
             None,
         )
         .unwrap();
-        let sa = SockaddrIn::new(0, 0, 0, 0, CONTROL_PORT);
+        let sa = SockaddrIn::new(Ipv4Addr::UNSPECIFIED, CONTROL_PORT);
         bind(sock.as_raw_fd(), &sa).unwrap();
         listen(&sock, 5).unwrap();
 
@@ -133,53 +129,14 @@ fn main() {
             "[服务端]    收到客户端 ConnInfo (QP={}, LID={})",
             client_info.qp_num, client_info.lid
         );
-        close(client_fd);
+        close(client_fd).unwrap_or_else(|e| eprintln!("[服务端] 关闭 client fd 警告: {:?}", e));
         drop(sock);
 
-        // ============== QP → RTR ==============
+        // ============== QP → RTR → RTS ==============
         println!("[服务端] 步进 7/8: QP → RTR → RTS");
-        let mut rtr_attr: ibv_qp_attr = zeroed();
-        rtr_attr.qp_state = ibv_qp_state::IBV_QPS_RTR;
-        rtr_attr.dest_qp_num = client_info.qp_num;
-        rtr_attr.rq_psn = 0;
-        rtr_attr.max_dest_rd_atomic = 1;
-        rtr_attr.min_rnr_timer = 12;
-        // Bug 2: 设置实际 port 的 active MTU
-        rtr_attr.path_mtu = active_mtu;
-        rtr_attr.ah_attr.dlid = client_info.lid;
-        rtr_attr.ah_attr.sl = 0;
-        rtr_attr.ah_attr.src_path_bits = 0;
-        rtr_attr.ah_attr.static_rate = 0;
-        rtr_attr.ah_attr.is_global = 0;
-        rtr_attr.ah_attr.port_num = 1;
-
-        let rtr_mask = (IBV_QP_STATE.0
-            | IBV_QP_AV.0
-            | IBV_QP_PATH_MTU.0
-            | IBV_QP_DEST_QPN.0
-            | IBV_QP_RQ_PSN.0
-            | IBV_QP_MAX_DEST_RD_ATOMIC.0
-            | IBV_QP_MIN_RNR_TIMER.0) as i32;
-        let ret = ibv_modify_qp(qp, &mut rtr_attr, rtr_mask);
-        srv_check(ret == 0, &format!("RTR 失败, ret={}", ret));
-
-        // ============== QP → RTS ==============
-        let mut rts_attr: ibv_qp_attr = zeroed();
-        rts_attr.qp_state = ibv_qp_state::IBV_QPS_RTS;
-        rts_attr.sq_psn = 0;
-        rts_attr.timeout = 14;
-        rts_attr.retry_cnt = 7;
-        rts_attr.rnr_retry = 7;
-        rts_attr.max_rd_atomic = 1;
-
-        let rts_mask = (IBV_QP_STATE.0
-            | IBV_QP_SQ_PSN.0
-            | IBV_QP_TIMEOUT.0
-            | IBV_QP_RETRY_CNT.0
-            | IBV_QP_RNR_RETRY.0
-            | IBV_QP_MAX_QP_RD_ATOMIC.0) as i32;
-        let ret = ibv_modify_qp(qp, &mut rts_attr, rts_mask);
-        srv_check(ret == 0, &format!("RTS 失败, ret={}", ret));
+        qp_to_rtr(qp, client_info.qp_num, client_info.lid, active_mtu, 1)
+            .unwrap_or_else(|e| panic!("[服务端] {}", e));
+        qp_to_rts(qp).unwrap_or_else(|e| panic!("[服务端] {}", e));
 
         println!("[服务端] 步进 8/8: RDMA 连接已就绪 ✓");
         println!("[服务端]    等待客户端 RDMA Write...");

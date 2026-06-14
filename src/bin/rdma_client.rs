@@ -1,7 +1,8 @@
 use ibverbs_sys::*;
 use nix::sys::socket::*;
 use rust_rdma::{
-    check, get_lid, get_port_mtu, tcp_recv_exact, tcp_send_all, ConnInfo, CONTROL_PORT,
+    check, get_lid, get_port_mtu, qp_to_init, qp_to_rtr, qp_to_rts, tcp_recv_exact, tcp_send_all,
+    ConnInfo, CONTROL_PORT,
 };
 use std::mem::{size_of, zeroed};
 use std::net::Ipv4Addr;
@@ -39,8 +40,7 @@ fn main() {
         )
         .unwrap();
         let ip = server_ip.parse::<Ipv4Addr>().unwrap();
-        let octets = ip.octets();
-        let sa = SockaddrIn::new(octets[0], octets[1], octets[2], octets[3], CONTROL_PORT);
+        let sa = SockaddrIn::new(ip, CONTROL_PORT);
         connect(sock, &sa).unwrap();
         println!("[客户端]    已连接服务端 {}:{}", server_ip, CONTROL_PORT);
 
@@ -63,7 +63,6 @@ fn main() {
         cli_check(!dev.is_null(), "没有可用的 RDMA 设备");
         let ctx = ibv_open_device(dev);
         cli_check(!ctx.is_null(), "ibv_open_device 失败");
-        // Bug 3: 释放设备列表
         ibv_free_device_list(dev_list);
 
         println!("[客户端] 步进 3/8: 分配 PD + 注册本地 MR");
@@ -109,18 +108,7 @@ fn main() {
 
         // ============== 步进 5: QP → INIT + 查询 LID ==============
         println!("[客户端] 步进 5/8: QP → INIT");
-        let mut attr: ibv_qp_attr = zeroed();
-        attr.qp_state = ibv_qp_state::IBV_QPS_INIT;
-        attr.pkey_index = 0;
-        attr.port_num = 1;
-        // Bug 1: 客户端 QP 不需要远程访问权限，设为 0
-        attr.qp_access_flags = 0;
-        let ret = ibv_modify_qp(
-            qp,
-            &mut attr,
-            (IBV_QP_STATE.0 | IBV_QP_PKEY_INDEX.0 | IBV_QP_PORT.0 | IBV_QP_ACCESS_FLAGS.0) as i32,
-        );
-        cli_check(ret == 0, &format!("INIT 失败, ret={}", ret));
+        qp_to_init(qp, 1, 0).unwrap_or_else(|e| panic!("[客户端] {}", e));
 
         let client_lid = get_lid(ctx, 1);
         let active_mtu = get_port_mtu(ctx, 1);
@@ -145,51 +133,13 @@ fn main() {
         );
         drop(sock);
 
-        // ============== 步进 6: QP → RTR ==============
+        // ============== 步进 6-7: QP → RTR → RTS ==============
         println!("[客户端] 步进 6/8: QP → RTR");
-        let mut rtr_attr: ibv_qp_attr = zeroed();
-        rtr_attr.qp_state = ibv_qp_state::IBV_QPS_RTR;
-        rtr_attr.dest_qp_num = server_info.qp_num;
-        rtr_attr.rq_psn = 0;
-        rtr_attr.max_dest_rd_atomic = 1;
-        rtr_attr.min_rnr_timer = 12;
-        // Bug 2: 设置实际 port 的 active MTU
-        rtr_attr.path_mtu = active_mtu;
-        rtr_attr.ah_attr.dlid = server_info.lid;
-        rtr_attr.ah_attr.sl = 0;
-        rtr_attr.ah_attr.src_path_bits = 0;
-        rtr_attr.ah_attr.static_rate = 0;
-        rtr_attr.ah_attr.is_global = 0;
-        rtr_attr.ah_attr.port_num = 1;
+        qp_to_rtr(qp, server_info.qp_num, server_info.lid, active_mtu, 1)
+            .unwrap_or_else(|e| panic!("[客户端] {}", e));
 
-        let rtr_mask = (IBV_QP_STATE.0
-            | IBV_QP_AV.0
-            | IBV_QP_PATH_MTU.0
-            | IBV_QP_DEST_QPN.0
-            | IBV_QP_RQ_PSN.0
-            | IBV_QP_MAX_DEST_RD_ATOMIC.0
-            | IBV_QP_MIN_RNR_TIMER.0) as i32;
-        let ret = ibv_modify_qp(qp, &mut rtr_attr, rtr_mask);
-        cli_check(ret == 0, &format!("RTR 失败, ret={}", ret));
-
-        // ============== 步进 7: QP → RTS ==============
         println!("[客户端] 步进 7/8: QP → RTS");
-        let mut rts_attr: ibv_qp_attr = zeroed();
-        rts_attr.qp_state = ibv_qp_state::IBV_QPS_RTS;
-        rts_attr.sq_psn = 0;
-        rts_attr.timeout = 14;
-        rts_attr.retry_cnt = 7;
-        rts_attr.rnr_retry = 7;
-        rts_attr.max_rd_atomic = 1;
-
-        let rts_mask = (IBV_QP_STATE.0
-            | IBV_QP_SQ_PSN.0
-            | IBV_QP_TIMEOUT.0
-            | IBV_QP_RETRY_CNT.0
-            | IBV_QP_RNR_RETRY.0
-            | IBV_QP_MAX_QP_RD_ATOMIC.0) as i32;
-        let ret = ibv_modify_qp(qp, &mut rts_attr, rts_mask);
-        cli_check(ret == 0, &format!("RTS 失败, ret={}", ret));
+        qp_to_rts(qp).unwrap_or_else(|e| panic!("[客户端] {}", e));
 
         // ============== 步进 8: 执行 RDMA Write ==============
         println!("[客户端] 步进 8/8: 执行 RDMA Write...");

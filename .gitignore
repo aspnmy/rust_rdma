@@ -2,3 +2,6 @@
 
 # Rust Loop Optimize skill temporary files
 _loop_*
+
+# Docker 测试环境
+_docker_test/

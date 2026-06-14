@@ -2,6 +2,23 @@ use ibverbs_sys::*;
 use nix::sys::socket::{recv, send, MsgFlags};
 use std::mem::zeroed;
 
+/// 断言宏：条件为假时打印错误消息并退出
+///
+/// # Usage
+/// ```ignore
+/// check!(ptr != null(), "指针为空");
+/// check!(ret == 0, &format!("操作失败, ret={}", ret));
+/// ```
+#[macro_export]
+macro_rules! check {
+    ($cond:expr, $msg:expr) => {{
+        if !$cond {
+            eprintln!("{}", $msg);
+            std::process::exit(1);
+        }
+    }};
+}
+
 /// RDMA 控制通道 TCP 端口
 pub const CONTROL_PORT: u16 = 9999;
 
@@ -87,6 +104,90 @@ pub unsafe fn get_lid(ctx: *mut ibv_context, port: u8) -> u16 {
     let ret = ibv_query_port(ctx, port, &mut port_attr as *mut _);
     assert_eq!(ret, 0, "ibv_query_port 失败, ret={}", ret);
     port_attr.lid
+}
+
+/// QP 状态转换：RESET → INIT
+///
+/// # Safety
+/// `ctx` 必须是有效的 ibv_context 指针，`qp` 必须是有效的 ibv_qp 指针
+pub unsafe fn qp_to_init(qp: *mut ibv_qp, port: u8, access_flags: u32) -> Result<(), String> {
+    let mut attr: ibv_qp_attr = zeroed();
+    attr.qp_state = ibv_qp_state::IBV_QPS_INIT;
+    attr.pkey_index = 0;
+    attr.port_num = port;
+    attr.qp_access_flags = access_flags;
+    let mask = (IBV_QP_STATE.0
+        | IBV_QP_PKEY_INDEX.0
+        | IBV_QP_PORT.0
+        | IBV_QP_ACCESS_FLAGS.0) as i32;
+    let ret = ibv_modify_qp(qp, &mut attr, mask);
+    if ret != 0 {
+        return Err(format!("QP → INIT 失败, ret={}", ret));
+    }
+    Ok(())
+}
+
+/// QP 状态转换：INIT → RTR
+///
+/// # Safety
+/// `qp` 必须是有效的 ibv_qp 指针
+pub unsafe fn qp_to_rtr(
+    qp: *mut ibv_qp,
+    dest_qpn: u32,
+    dest_lid: u16,
+    path_mtu: ibv_mtu,
+    port: u8,
+) -> Result<(), String> {
+    let mut attr: ibv_qp_attr = zeroed();
+    attr.qp_state = ibv_qp_state::IBV_QPS_RTR;
+    attr.dest_qp_num = dest_qpn;
+    attr.rq_psn = 0;
+    attr.max_dest_rd_atomic = 1;
+    attr.min_rnr_timer = 12;
+    attr.path_mtu = path_mtu;
+    attr.ah_attr.dlid = dest_lid;
+    attr.ah_attr.sl = 0;
+    attr.ah_attr.src_path_bits = 0;
+    attr.ah_attr.static_rate = 0;
+    attr.ah_attr.is_global = 0;
+    attr.ah_attr.port_num = port;
+    let mask = (IBV_QP_STATE.0
+        | IBV_QP_AV.0
+        | IBV_QP_PATH_MTU.0
+        | IBV_QP_DEST_QPN.0
+        | IBV_QP_RQ_PSN.0
+        | IBV_QP_MAX_DEST_RD_ATOMIC.0
+        | IBV_QP_MIN_RNR_TIMER.0) as i32;
+    let ret = ibv_modify_qp(qp, &mut attr, mask);
+    if ret != 0 {
+        return Err(format!("QP → RTR 失败, ret={}", ret));
+    }
+    Ok(())
+}
+
+/// QP 状态转换：RTR → RTS
+///
+/// # Safety
+/// `qp` 必须是有效的 ibv_qp 指针
+pub unsafe fn qp_to_rts(qp: *mut ibv_qp) -> Result<(), String> {
+    let mut attr: ibv_qp_attr = zeroed();
+    attr.qp_state = ibv_qp_state::IBV_QPS_RTS;
+    attr.sq_psn = 0;
+    attr.timeout = 14;
+    attr.retry_cnt = 7;
+    attr.rnr_retry = 7;
+    attr.max_rd_atomic = 1;
+    let mask = (IBV_QP_STATE.0
+        | IBV_QP_SQ_PSN.0
+        | IBV_QP_TIMEOUT.0
+        | IBV_QP_RETRY_CNT.0
+        | IBV_QP_RNR_RETRY.0
+        | IBV_QP_MAX_QP_RD_ATOMIC.0) as i32;
+    let ret = ibv_modify_qp(qp, &mut attr, mask);
+    if ret != 0 {
+        return Err(format!("QP → RTS 失败, ret={}", ret));
+    }
+    Ok(())
 }
 
 /// 查询端口的 active MTU
