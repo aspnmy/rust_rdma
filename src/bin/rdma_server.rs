@@ -1,3 +1,4 @@
+use ibverbs_sys::ibv_access_flags;
 use ibverbs_sys::*;
 use nix::sys::socket::*;
 use nix::unistd::close;
@@ -7,7 +8,7 @@ use rust_rdma::{
 };
 use std::alloc::{alloc, dealloc, Layout};
 use std::mem::{size_of, zeroed};
-use std::net::Ipv4Addr;
+use std::os::fd::AsRawFd;
 use std::os::raw::c_void;
 use std::ptr;
 
@@ -50,8 +51,10 @@ fn main() {
             pd,
             buf as *mut c_void,
             MEM_SIZE,
-            (IBV_ACCESS_LOCAL_WRITE.0 | IBV_ACCESS_REMOTE_WRITE.0 | IBV_ACCESS_REMOTE_READ.0)
-                as i32,
+            (ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
+                | ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
+                | ibv_access_flags::IBV_ACCESS_REMOTE_READ)
+                .0 as i32,
         );
         srv_check(!mr.is_null(), "ibv_reg_mr 失败");
 
@@ -77,7 +80,8 @@ fn main() {
         qp_to_init(
             qp,
             1,
-            (IBV_ACCESS_REMOTE_WRITE.0 | IBV_ACCESS_REMOTE_READ.0) as u32,
+            (ibv_access_flags::IBV_ACCESS_REMOTE_WRITE | ibv_access_flags::IBV_ACCESS_REMOTE_READ)
+                .0,
         )
         .unwrap_or_else(|e| panic!("[服务端] {}", e));
 
@@ -97,9 +101,9 @@ fn main() {
             None,
         )
         .unwrap();
-        let sa = SockaddrIn::new(Ipv4Addr::UNSPECIFIED, CONTROL_PORT);
+        let sa = SockaddrIn::new(0, 0, 0, 0, CONTROL_PORT);
         bind(sock.as_raw_fd(), &sa).unwrap();
-        listen(&sock, 5).unwrap();
+        listen(&sock, Backlog::new(5).unwrap()).unwrap();
 
         let client_fd = accept(sock.as_raw_fd()).unwrap();
         println!("[服务端]    客户端已连接 (fd={})", client_fd);

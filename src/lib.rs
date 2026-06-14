@@ -1,3 +1,4 @@
+use ibverbs_sys::ibv_qp_attr_mask;
 use ibverbs_sys::*;
 use nix::sys::socket::{recv, send, MsgFlags};
 use std::mem::zeroed;
@@ -62,6 +63,9 @@ impl ConnInfo {
     }
 
     /// 从字节切片反序列化（原地覆盖）
+    ///
+    /// # Safety
+    /// `buf` 长度必须等于 `size_of::<ConnInfo>()`，且内容为有效 ConnInfo 的原始字节
     pub unsafe fn from_bytes(&mut self, buf: &[u8]) {
         std::ptr::copy_nonoverlapping(buf.as_ptr(), self as *mut _ as *mut u8, size_of_val(self));
     }
@@ -101,7 +105,13 @@ pub fn tcp_recv_exact(fd: i32, buf: &mut [u8]) -> Result<(), String> {
 /// `ctx` 必须是有效的 ibv_context 指针
 pub unsafe fn get_lid(ctx: *mut ibv_context, port: u8) -> u16 {
     let mut port_attr: ibv_port_attr = zeroed();
-    let ret = ibv_query_port(ctx, port, &mut port_attr as *mut _);
+    // ibv_query_port 签名要求 *mut _compat_ibv_port_attr（兼容层桩类型），
+    // transmute 将真实 ibv_port_attr 指针安全转换为兼容层期望的类型
+    let ret = ibv_query_port(
+        ctx,
+        port,
+        &mut port_attr as *mut ibv_port_attr as *mut _compat_ibv_port_attr,
+    );
     assert_eq!(ret, 0, "ibv_query_port 失败, ret={}", ret);
     port_attr.lid
 }
@@ -116,10 +126,11 @@ pub unsafe fn qp_to_init(qp: *mut ibv_qp, port: u8, access_flags: u32) -> Result
     attr.pkey_index = 0;
     attr.port_num = port;
     attr.qp_access_flags = access_flags;
-    let mask = (IBV_QP_STATE.0
-        | IBV_QP_PKEY_INDEX.0
-        | IBV_QP_PORT.0
-        | IBV_QP_ACCESS_FLAGS.0) as i32;
+    let mask = (ibv_qp_attr_mask::IBV_QP_STATE
+        | ibv_qp_attr_mask::IBV_QP_PKEY_INDEX
+        | ibv_qp_attr_mask::IBV_QP_PORT
+        | ibv_qp_attr_mask::IBV_QP_ACCESS_FLAGS)
+        .0 as i32;
     let ret = ibv_modify_qp(qp, &mut attr, mask);
     if ret != 0 {
         return Err(format!("QP → INIT 失败, ret={}", ret));
@@ -151,13 +162,14 @@ pub unsafe fn qp_to_rtr(
     attr.ah_attr.static_rate = 0;
     attr.ah_attr.is_global = 0;
     attr.ah_attr.port_num = port;
-    let mask = (IBV_QP_STATE.0
-        | IBV_QP_AV.0
-        | IBV_QP_PATH_MTU.0
-        | IBV_QP_DEST_QPN.0
-        | IBV_QP_RQ_PSN.0
-        | IBV_QP_MAX_DEST_RD_ATOMIC.0
-        | IBV_QP_MIN_RNR_TIMER.0) as i32;
+    let mask = (ibv_qp_attr_mask::IBV_QP_STATE
+        | ibv_qp_attr_mask::IBV_QP_AV
+        | ibv_qp_attr_mask::IBV_QP_PATH_MTU
+        | ibv_qp_attr_mask::IBV_QP_DEST_QPN
+        | ibv_qp_attr_mask::IBV_QP_RQ_PSN
+        | ibv_qp_attr_mask::IBV_QP_MAX_DEST_RD_ATOMIC
+        | ibv_qp_attr_mask::IBV_QP_MIN_RNR_TIMER)
+        .0 as i32;
     let ret = ibv_modify_qp(qp, &mut attr, mask);
     if ret != 0 {
         return Err(format!("QP → RTR 失败, ret={}", ret));
@@ -177,17 +189,42 @@ pub unsafe fn qp_to_rts(qp: *mut ibv_qp) -> Result<(), String> {
     attr.retry_cnt = 7;
     attr.rnr_retry = 7;
     attr.max_rd_atomic = 1;
-    let mask = (IBV_QP_STATE.0
-        | IBV_QP_SQ_PSN.0
-        | IBV_QP_TIMEOUT.0
-        | IBV_QP_RETRY_CNT.0
-        | IBV_QP_RNR_RETRY.0
-        | IBV_QP_MAX_QP_RD_ATOMIC.0) as i32;
+    let mask = (ibv_qp_attr_mask::IBV_QP_STATE
+        | ibv_qp_attr_mask::IBV_QP_SQ_PSN
+        | ibv_qp_attr_mask::IBV_QP_TIMEOUT
+        | ibv_qp_attr_mask::IBV_QP_RETRY_CNT
+        | ibv_qp_attr_mask::IBV_QP_RNR_RETRY
+        | ibv_qp_attr_mask::IBV_QP_MAX_QP_RD_ATOMIC)
+        .0 as i32;
     let ret = ibv_modify_qp(qp, &mut attr, mask);
     if ret != 0 {
         return Err(format!("QP → RTS 失败, ret={}", ret));
     }
     Ok(())
+}
+
+/// 通过 ops table 调用 ibv_post_send（vendor rdma-core 内联函数包装）
+///
+/// # Safety
+/// `qp` 必须是有效的 ibv_qp 指针
+pub unsafe fn post_send(
+    qp: *mut ibv_qp,
+    wr: *mut ibv_send_wr,
+    bad_wr: *mut *mut ibv_send_wr,
+) -> i32 {
+    let ctx = (*qp).context;
+    let f = (*ctx).ops.post_send.expect("post_send ops 不可用");
+    f(qp, wr, bad_wr)
+}
+
+/// 通过 ops table 调用 ibv_poll_cq（vendor rdma-core 内联函数包装）
+///
+/// # Safety
+/// `cq` 必须是有效的 ibv_cq 指针
+pub unsafe fn poll_cq(cq: *mut ibv_cq, num_entries: i32, wc: *mut ibv_wc) -> i32 {
+    let ctx = (*cq).context;
+    let f = (*ctx).ops.poll_cq.expect("poll_cq ops 不可用");
+    f(cq, num_entries, wc)
 }
 
 /// 查询端口的 active MTU
@@ -196,7 +233,11 @@ pub unsafe fn qp_to_rts(qp: *mut ibv_qp) -> Result<(), String> {
 /// `ctx` 必须是有效的 ibv_context 指针
 pub unsafe fn get_port_mtu(ctx: *mut ibv_context, port: u8) -> ibv_mtu {
     let mut port_attr: ibv_port_attr = zeroed();
-    let ret = ibv_query_port(ctx, port, &mut port_attr as *mut _);
+    let ret = ibv_query_port(
+        ctx,
+        port,
+        &mut port_attr as *mut ibv_port_attr as *mut _compat_ibv_port_attr,
+    );
     assert_eq!(ret, 0, "ibv_query_port MTU 失败, ret={}", ret);
     port_attr.active_mtu
 }

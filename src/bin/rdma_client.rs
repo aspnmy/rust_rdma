@@ -1,11 +1,12 @@
 use ibverbs_sys::*;
+use ibverbs_sys::{ibv_access_flags, ibv_send_flags};
 use nix::sys::socket::*;
 use rust_rdma::{
-    check, get_lid, get_port_mtu, qp_to_init, qp_to_rtr, qp_to_rts, tcp_recv_exact, tcp_send_all,
-    ConnInfo, CONTROL_PORT,
+    check, get_lid, get_port_mtu, poll_cq, post_send, qp_to_init, qp_to_rtr, qp_to_rts,
+    tcp_recv_exact, tcp_send_all, ConnInfo, CONTROL_PORT,
 };
 use std::mem::{size_of, zeroed};
-use std::net::Ipv4Addr;
+use std::os::fd::AsRawFd;
 use std::os::raw::c_void;
 use std::ptr;
 
@@ -39,14 +40,15 @@ fn main() {
             None,
         )
         .unwrap();
-        let ip = server_ip.parse::<Ipv4Addr>().unwrap();
-        let sa = SockaddrIn::new(ip, CONTROL_PORT);
-        connect(sock, &sa).unwrap();
+        let ip = server_ip.parse::<std::net::Ipv4Addr>().unwrap();
+        let octets = ip.octets();
+        let sa = SockaddrIn::new(octets[0], octets[1], octets[2], octets[3], CONTROL_PORT);
+        connect(sock.as_raw_fd(), &sa).unwrap();
         println!("[客户端]    已连接服务端 {}:{}", server_ip, CONTROL_PORT);
 
         // 接收服务端 ConnInfo (字节序还原)
         let mut raw_buf = vec![0u8; size_of::<ConnInfo>()];
-        tcp_recv_exact(sock, &mut raw_buf).unwrap();
+        tcp_recv_exact(sock.as_raw_fd(), &mut raw_buf).unwrap();
         let mut server_info: ConnInfo = zeroed();
         server_info.from_bytes(&raw_buf);
         let server_info = server_info.from_be();
@@ -85,7 +87,7 @@ fn main() {
             pd,
             local_buf.as_mut_ptr() as *mut c_void,
             local_buf.len(),
-            IBV_ACCESS_LOCAL_WRITE.0 as i32,
+            ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0 as i32,
         );
         cli_check(!mr.is_null(), "ibv_reg_mr 失败");
 
@@ -126,7 +128,7 @@ fn main() {
             port: 1,
         };
         let be_info = client_info.to_be();
-        tcp_send_all(sock, be_info.as_bytes()).unwrap();
+        tcp_send_all(sock.as_raw_fd(), be_info.as_bytes()).unwrap();
         println!(
             "[客户端]    已发送客户端 ConnInfo (QP={}, LID={})",
             client_info.qp_num, client_info.lid
@@ -158,12 +160,12 @@ fn main() {
         wr.sg_list = &mut sge;
         wr.num_sge = 1;
         wr.opcode = ibv_wr_opcode::IBV_WR_RDMA_WRITE;
-        wr.send_flags = ibverbs_sys::IBV_SEND_SIGNALED.0 as u32;
+        wr.send_flags = ibv_send_flags::IBV_SEND_SIGNALED.0;
         wr.wr.rdma.remote_addr = server_info.buf_addr;
         wr.wr.rdma.rkey = server_info.rkey;
 
         let mut bad_wr: *mut ibv_send_wr = ptr::null_mut();
-        let ret = ibv_post_send(qp, &mut wr, &mut bad_wr);
+        let ret = post_send(qp, &mut wr, &mut bad_wr);
         cli_check(ret == 0, &format!("ibv_post_send 失败, ret={}", ret));
         println!("[客户端]    RDMA Write 请求已提交");
 
@@ -171,7 +173,7 @@ fn main() {
         let mut wc: ibv_wc = zeroed();
         let mut poll_count = 0;
         loop {
-            let ne = ibv_poll_cq(cq, 1, &mut wc);
+            let ne = poll_cq(cq, 1, &mut wc);
             if ne > 0 {
                 break;
             }
@@ -185,15 +187,16 @@ fn main() {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
 
-        let status = wc.status;
         cli_check(
-            status == ibv_wc_status::IBV_WC_SUCCESS.0 as u32,
-            &format!("RDMA Write 完成状态异常: 0x{:x}", status),
+            wc.is_valid(),
+            &format!("RDMA Write 完成状态异常: {:?}", wc.error().map(|(s, _)| s)),
         );
         println!("[客户端]    ✓ RDMA Write 完成! (WC status=SUCCESS)");
         println!(
             "[客户端]    写到服务端 0x{:x} (rkey=0x{:x}) 共 {} 字节",
-            server_info.buf_addr, server_info.rkey, wc.byte_len,
+            server_info.buf_addr,
+            server_info.rkey,
+            wc.len(),
         );
         println!("[客户端]    写入数据: {:?}", &local_buf[..DATA_SIZE]);
 
